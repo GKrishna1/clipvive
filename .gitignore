@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# Secrets / environment / TLS
+.env
+.env.*
+*.pem
+secrets.yml
+
+# Storage, logs, backups, runtime
+storage/
+logs/
+tmp/
+backups/
+*.log
+
+# Docker
+docker-compose.override.yml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

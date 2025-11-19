@@ -1,0 +1,130 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
+from pydantic import BaseModel, EmailStr
+from sqlmodel import select
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+import os, uuid
+from typing import Optional, Dict
+from .db import get_session
+from .models import User, Session as UserSession
+from datetime import datetime, timedelta
+
+router = APIRouter()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days for access (example)
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    jti: str
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+    device_id: str
+    device_type: str  # 'browser' or 'mobile'
+
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    jti = str(uuid.uuid4())
+    to_encode.update({"jti": jti})
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded, jti
+
+@router.post("/register")
+def register(payload: RegisterIn, session=Depends(get_session)):
+    # check exists
+    q = select(User).where(User.email == payload.email)
+    user = session.exec(q).first()
+    if user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(email=payload.email, hashed_password=get_password_hash(payload.password))
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return {"id": user.id, "email": user.email}
+
+@router.post("/login", response_model=TokenOut)
+def login(payload: LoginIn, session=Depends(get_session)):
+    q = select(User).where(User.email == payload.email)
+    user = session.exec(q).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    # create token
+    token_data = {"sub": str(user.id), "email": user.email}
+    access_token, jti = create_access_token(token_data)
+    # session enforcement: allow only one browser and one mobile
+    # remove oldest session of same device_type if exists
+    q2 = select(UserSession).where(UserSession.user_id == user.id, UserSession.device_type == payload.device_type)
+    existing = session.exec(q2).all()
+    if len(existing) >= 1:
+        # remove oldest (created_at)
+        oldest = sorted(existing, key=lambda s: s.created_at)[0]
+        session.delete(oldest)
+    # add new session record
+    sess = UserSession(user_id=user.id, device_id=payload.device_id, device_type=payload.device_type, jti=jti)
+    session.add(sess)
+    session.commit()
+    return {"access_token": access_token, "jti": jti}
+
+@router.post("/logout")
+def logout(authorization: Optional[str] = Header(None), session=Depends(get_session)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    token = authorization.split("Bearer ")[-1] if "Bearer " in authorization else authorization
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+        user_id = int(payload.get("sub"))
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    # remove session with jti
+    q = select(UserSession).where(UserSession.user_id == user_id, UserSession.jti == jti)
+    s = session.exec(q).first()
+    if s:
+        session.delete(s)
+        session.commit()
+    return {"logged_out": True}
+
+# dependency to get current user and ensure session exists
+from fastapi import Security
+
+def get_current_user(authorization: Optional[str] = Header(None), session=Depends(get_session)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    token = authorization.split("Bearer ")[-1] if "Bearer " in authorization else authorization
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+        user_id = int(payload.get("sub"))
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    # verify session exists
+    q = select(UserSession).where(UserSession.user_id == user_id, UserSession.jti == jti)
+    ss = session.exec(q).first()
+    if not ss:
+        raise HTTPException(status_code=401, detail="Session not found or revoked")
+    # return user object
+    q2 = select(User).where(User.id == user_id)
+    user = session.exec(q2).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user

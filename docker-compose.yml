@@ -1,0 +1,93 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: clipvive
+      POSTGRES_PASSWORD: clipvive_pass
+      POSTGRES_DB: clipvive_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    restart: always
+    volumes:
+      - redis-data:/data
+
+  backend:
+    build: ./backend
+    image: clipvive-backend:latest
+    restart: unless-stopped
+    env_file:
+      - ./env/backend.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./storage:/data/storage
+
+  worker:
+    image: clipvive-backend:latest
+    depends_on:
+      - redis
+      - postgres
+    command: ["rq", "worker", "default", "--url", "redis://redis:6379/0"]
+    env_file:
+      - ./env/backend.env
+    volumes:
+      - ./storage:/data/storage
+    restart: unless-stopped
+
+  cleaner:
+    image: clipvive-backend:latest
+    depends_on:
+      - backend
+    command: ["python3", "-u", "-m", "app.cleaner"]
+    env_file:
+      - ./env/backend.env
+    volumes:
+      - ./storage:/data/storage
+    restart: unless-stopped
+
+  bot:
+    # Use either a prebuilt image or build from local ./bot directory.
+    # Replace with your actual image name or build context.
+    # image: clipvive-bot:latest
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: clipvive-bot-1
+    restart: unless-stopped
+    environment:
+      # Put runtime env here. Use .env for secrets and API keys.
+      - ENV=production
+      - LOG_LEVEL=info
+      # Example DB/Redis bindings (optional)
+      - DATABASE_URL=postgresql://clipvive:password@postgres:5432/clipvive_db
+      - REDIS_URL=redis://redis:6379/0
+      # Add any BYO keys you need (but store them in .env, not here)
+    depends_on:
+      - postgres
+      - redis
+    # Map host localhost:8001 to container:8000
+    ports:
+      - "127.0.0.1:8001:8000"
+    # Optional: mount code/config for easy development / config
+    volumes:
+      - ./bot:/app:ro          # remove :ro when mounting for development with hot-reload
+      - ./bot/log:/var/log/bot
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  redis-data:
+  pgdata:

@@ -1,0 +1,79 @@
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+import os
+import uuid
+from redis import Redis
+from rq import Queue
+from typing import Dict
+
+from .db import init_db, get_session
+from .auth import router as auth_router, get_current_user
+from .models import User
+from sqlmodel import select
+
+app = FastAPI(title="clipvive-api")
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+app.include_router(auth_router, prefix="/auth")
+
+@app.get("/health")
+async def health():
+    return {"status":"ok","service":"clipvive-api"}
+
+class EchoIn(BaseModel):
+    text: str
+
+@app.post("/api/echo")
+async def echo(payload: EchoIn):
+    return {"echo": payload.text}
+
+# storage info endpoint
+@app.get("/api/storage")
+def storage_info(user: User = Depends(get_current_user), session=Depends(get_session)):
+    # determine quota based on plan env vars
+    plan = user.plan or "free"
+    quotas = {
+        "free": int(os.getenv("PLAN_FREE_BYTES", "524288000")),
+        "basic": int(os.getenv("PLAN_BASIC_BYTES", "5368709120")),
+        "pro": int(os.getenv("PLAN_PRO_BYTES", "21474836480")),
+    }
+    quota = quotas.get(plan, quotas["free"])
+    return {"used_bytes": user.storage_used_bytes, "quota_bytes": quota, "plan": plan}
+
+# enqueue input
+class EnqueueIn(BaseModel):
+    text: str
+
+# build Redis/RQ queue
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+redis_conn = Redis.from_url(REDIS_URL)
+q = Queue("default", connection=redis_conn)
+
+@app.post("/api/enqueue")
+def enqueue(payload: EnqueueIn, user: User = Depends(get_current_user), session=Depends(get_session)) -> Dict:
+    # conservative estimate of produced file size (bytes)
+    estimated_size = max(len(payload.text.encode('utf-8')) + 1024, 1024)
+    # get quota
+    plan = user.plan or "free"
+    quotas = {
+        "free": int(os.getenv("PLAN_FREE_BYTES", "524288000")),
+        "basic": int(os.getenv("PLAN_BASIC_BYTES", "5368709120")),
+        "pro": int(os.getenv("PLAN_PRO_BYTES", "21474836480")),
+    }
+    quota = quotas.get(plan, quotas["free"])
+    if (user.storage_used_bytes or 0) + estimated_size > quota:
+        raise HTTPException(status_code=403, detail="Enqueue would exceed your storage quota. Consider upgrading plan.")
+    # otherwise enqueue and pass owner id so worker can account for storage
+    job_id = str(uuid.uuid4())
+    from .tasks import process_task
+    # enqueue with owner_id argument
+    job = q.enqueue(process_task, payload.text, job_id, user.id, job_id=job_id, result_ttl=5000)
+    return {"enqueued": True, "job_id": job_id, "rq_id": job.id}
+
+# example protected route
+@app.get("/api/me")
+def me(user=Depends(get_current_user)):
+    return {"id": user.id, "email": user.email}
